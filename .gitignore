@@ -1,0 +1,27 @@
+dataset/
+result/
+.idea/
+.vscode/
+.git
+*.DS_Store
+venv/
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Large files / archives
+*.tar
+*.zip
+*.gz
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# Claude internal
+.claude/
+
+# Test output / reports
+*.csv
