@@ -86,6 +86,9 @@ MODEL_HYPER_PARAMS = {
     "use_adaln": False,
     "use_rma": False,
     "prediction_target": "eps",
+    "retrieval_dropout_prob": 0.0,
+    "cfg_scale": 1.0,
+    "cfg_drop_query": False,
 }
 
 

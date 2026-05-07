@@ -194,6 +194,16 @@ class CRAFTModel(nn.Module):
                 torch.ones(self.num_query_patches, config.d_model) * 2.0
             )
         self.token_type_embed = nn.Embedding(2, config.d_model)
+        self.retrieval_dropout_prob = float(getattr(config, "retrieval_dropout_prob", 0.0))
+        self.cfg_scale = float(getattr(config, "cfg_scale", 1.0))
+        self.cfg_drop_query = bool(getattr(config, "cfg_drop_query", False))
+        self.null_retrieval_token = nn.Parameter(torch.zeros(1, 1, config.d_model))
+        nn.init.normal_(self.null_retrieval_token, std=0.02)
+        if self.cfg_drop_query:
+            self.null_query_token = nn.Parameter(torch.zeros(1, 1, config.d_model))
+            nn.init.normal_(self.null_query_token, std=0.02)
+        else:
+            self.null_query_token = None
         self.scheduler = DiffusionScheduler(
             num_steps=config.num_diffusion_steps,
             beta_start=config.beta_start,
@@ -632,6 +642,8 @@ class CRAFTModel(nn.Module):
         x_t: Optional[torch.Tensor] = None,
         t: Optional[torch.Tensor] = None,
         noise: Optional[torch.Tensor] = None,
+        drop_retrieval: Optional[torch.Tensor] = None,
+        drop_query: Optional[torch.Tensor] = None,
     ) -> dict:
         retrieval_output = self._retrieve(
             query_context, future=future, x_t=x_t, t=t, noise=noise
@@ -710,6 +722,24 @@ class CRAFTModel(nn.Module):
         else:
             fused_tokens, fusion_gate = self._fuse_views(query_tokens, reconstructed_tokens)
 
+        # ── CFG training-time dropout ──────────────────────────────────────────
+        # drop_retrieval: [B] bool mask (True → replace fused view with null token)
+        # drop_query:     [B] bool mask (True → replace query view with null token)
+        # Both are None at inference; during training they are sampled in compute_loss.
+        null_fused = self.null_retrieval_token.expand(
+            fused_tokens.shape[0], fused_tokens.shape[1], -1
+        )
+        if drop_retrieval is not None and drop_retrieval.any():
+            mask = drop_retrieval.view(-1, 1, 1)  # [B, 1, 1]
+            fused_tokens = torch.where(mask, null_fused, fused_tokens)
+
+        if self.null_query_token is not None and drop_query is not None and drop_query.any():
+            null_q = self.null_query_token.expand(
+                query_tokens.shape[0], query_tokens.shape[1], -1
+            )
+            mask_q = drop_query.view(-1, 1, 1)
+            query_tokens = torch.where(mask_q, null_q, query_tokens)
+
         typed_query_tokens = query_tokens + self.token_type_embed.weight[0].view(1, 1, -1)
         typed_fused_tokens = fused_tokens + self.token_type_embed.weight[1].view(1, 1, -1)
         condition = torch.cat([typed_query_tokens, typed_fused_tokens], dim=1)  # [B, 2S, d]
@@ -731,8 +761,20 @@ class CRAFTModel(nn.Module):
         # Sample (x_t, t, noise) first so they can be reused by the predictive
         # reranker utility computation inside _retrieve → _compute_reranker_loss.
         x_t, t, noise = self.scheduler.training_sample(future)
+        # ── CFG training-time dropout masks ───────────────────────────────────
+        # Randomly null-out the retrieval (fused) view so the denoiser learns to
+        # denoise without retrieval context, enabling CFG mixing at inference.
+        drop_retrieval = None
+        drop_query = None
+        if self.retrieval_dropout_prob > 0.0:
+            B = query_context.shape[0]
+            device = query_context.device
+            drop_retrieval = torch.rand(B, device=device) < self.retrieval_dropout_prob
+            if self.cfg_drop_query:
+                drop_query = torch.rand(B, device=device) < self.retrieval_dropout_prob
         condition_dict = self.prepare_condition(
-            query_context, future=future, x_t=x_t, t=t, noise=noise
+            query_context, future=future, x_t=x_t, t=t, noise=noise,
+            drop_retrieval=drop_retrieval, drop_query=drop_query,
         )
         condition = condition_dict["condition"]
 
@@ -788,9 +830,19 @@ class CRAFTModel(nn.Module):
         }
 
     def _ddim_loop(
-        self, condition: torch.Tensor, batch_size: int, device: torch.device
+        self,
+        condition: torch.Tensor,
+        batch_size: int,
+        device: torch.device,
+        condition_uncond: Optional[torch.Tensor] = None,
+        cfg_scale: float = 1.0,
     ) -> torch.Tensor:
-        """Run a single DDIM sampling chain from random noise to x0."""
+        """Run a single DDIM sampling chain from random noise to x0.
+
+        When condition_uncond is provided and cfg_scale != 1.0, applies
+        classifier-free guidance: pred = pred_uncond + cfg_scale * (pred_cond - pred_uncond).
+        """
+        use_cfg = (cfg_scale != 1.0) and (condition_uncond is not None)
         sample = torch.randn(
             batch_size, self.pred_len, self.input_dim, device=device
         )
@@ -809,10 +861,16 @@ class CRAFTModel(nn.Module):
             t_prev = torch.full_like(t, t_prev_value)
             if self.prediction_target == "x0":
                 pred_x0 = self.denoiser(sample, t, condition)
+                if use_cfg:
+                    pred_x0_uncond = self.denoiser(sample, t, condition_uncond)
+                    pred_x0 = pred_x0_uncond + cfg_scale * (pred_x0 - pred_x0_uncond)
                 eps = self.scheduler.eps_from_x0(sample, t, pred_x0)
                 sample = self.scheduler.ddim_step(sample, t, t_prev, eps)
             else:
                 pred_noise = self.denoiser(sample, t, condition)
+                if use_cfg:
+                    pred_noise_uncond = self.denoiser(sample, t, condition_uncond)
+                    pred_noise = pred_noise_uncond + cfg_scale * (pred_noise - pred_noise_uncond)
                 sample = self.scheduler.ddim_step(sample, t, t_prev, pred_noise)
         return sample
 
@@ -824,13 +882,25 @@ class CRAFTModel(nn.Module):
         B = query_context.shape[0]
         device = query_context.device
 
+        # ── Classifier-Free Guidance ───────────────────────────────────────────
+        # Build the unconditional condition by replacing fused tokens with the
+        # null retrieval token (no second retrieval forward pass needed).
+        cfg_scale = self.cfg_scale
+        condition_uncond = None
+        if cfg_scale != 1.0:
+            query_tokens = condition_dict["query_tokens"]  # [B, S, d]
+            null_fused = self.null_retrieval_token.expand(B, query_tokens.shape[1], -1)
+            typed_query_uncond = query_tokens + self.token_type_embed.weight[0].view(1, 1, -1)
+            typed_null_fused = null_fused + self.token_type_embed.weight[1].view(1, 1, -1)
+            condition_uncond = torch.cat([typed_query_uncond, typed_null_fused], dim=1)
+
         if num_samples <= 1:
-            return self._ddim_loop(condition, B, device)
+            return self._ddim_loop(condition, B, device, condition_uncond, cfg_scale)
 
         # Multi-sample ensemble: run K independent DDIM chains from different
         # random noise, then average the predictions.  The condition (retrieval
         # + encoding + fusion) is computed once and reused across all chains.
         accum = torch.zeros(B, self.pred_len, self.input_dim, device=device)
         for _ in range(num_samples):
-            accum += self._ddim_loop(condition, B, device)
+            accum += self._ddim_loop(condition, B, device, condition_uncond, cfg_scale)
         return accum / num_samples
